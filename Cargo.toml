@@ -14,3 +14,10 @@ tracing = "*"
 tracing-subscriber = "*"
 
 tokio = { version = "*", features=["full"] }
+
+serde = {version = "=1.0", features = ["derive"] }
+libp2p = { version = "*", features = ["tcp-tokio", "mdns-tokio"] }
+
+futures = "*"
+
+env_logger = "*"
