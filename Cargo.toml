@@ -1,0 +1,16 @@
+[package]
+name = "bigblackchord"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# clap is used for argument parsing
+clap = {version = "*", features = ["derive", "unicode", "cargo"]}
+
+# we use tracing to handle logs
+tracing = "*"
+tracing-subscriber = "*"
+
+tokio = { version = "*", features=["full"] }
