@@ -12,12 +12,9 @@ clap = {version = "*", features = ["derive", "unicode", "cargo"]}
 # we use tracing to handle logs
 tracing = "*"
 tracing-subscriber = "*"
-
-tokio = { version = "*", features=["full"] }
-
-serde = {version = "=1.0", features = ["derive"] }
-libp2p = { version = "*", features = ["tcp-tokio", "mdns-tokio"] }
+libp2p = "*"
 
 futures = "*"
 
 env_logger = "*"
+async-std = {version = "*", features = ["attributes"]}

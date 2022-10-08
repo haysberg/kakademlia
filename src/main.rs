@@ -1,144 +1,96 @@
-use futures::StreamExt;
-use libp2p::noise::{Keypair, X25519Spec};
-use libp2p::tcp::GenTcpConfig;
-use libp2p::{
-    core::upgrade,
-    floodsub::{self, Floodsub, FloodsubEvent},
-    identity,
-    mdns::{MdnsEvent, TokioMdns},
-    mplex,
-    noise::{NoiseConfig},
-    swarm::{SwarmBuilder, SwarmEvent},
-    tcp::TokioTcpTransport,
-    Multiaddr,
-    NetworkBehaviour,
-    PeerId,
-    Transport,
-};
-use std::error::Error;
-use tokio::io::{self, AsyncBufReadExt};
 
-/// The `tokio::main` attribute sets up a tokio runtime.
-#[tokio::main]
+use async_std::task;
+use futures::StreamExt;
+use libp2p::kad::record::store::MemoryStore;
+use libp2p::kad::{GetClosestPeersError, Kademlia, KademliaConfig, KademliaEvent, QueryResult};
+use libp2p::{
+    development_transport, identity,
+    swarm::{Swarm, SwarmEvent},
+    Multiaddr, PeerId,
+};
+use std::{env, error::Error, str::FromStr, time::Duration};
+
+const BOOTNODES: [&str; 4] = [
+    "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+    "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+];
+
+#[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
-    // Create a random PeerId
-    let id_keys = identity::Keypair::generate_ed25519();
-    let peer_id = PeerId::from(id_keys.public());
-    let dh_keys = Keypair::<X25519Spec>::new().into_authentic(&id_keys).unwrap();
-    println!("Local peer id: {:?}", peer_id);
+    // Create a random key for ourselves.
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
 
-    let noise = NoiseConfig::xx(dh_keys).into_authenticated();
+    // Set up a an encrypted DNS-enabled TCP Transport over the Mplex protocol
+    let transport = development_transport(local_key).await?;
 
-    // Create a tokio-based TCP transport use noise for authenticated
-    // encryption and Mplex for multiplexing of substreams on a TCP stream.
-    let transport = TokioTcpTransport::new(GenTcpConfig::default().nodelay(true))
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise)
-        .multiplex(mplex::MplexConfig::new())
-        .boxed();
-
-    // Create a Floodsub topic
-    let floodsub_topic = floodsub::Topic::new("chat");
-
-    // We create a custom  behaviour that combines floodsub and mDNS.
-    // The derive generates a delegating `NetworkBehaviour` impl.
-    #[derive(NetworkBehaviour)]
-    #[behaviour(out_event = "MyBehaviourEvent")]
-    struct MyBehaviour {
-        floodsub: Floodsub,
-        mdns: TokioMdns,
-    }
-
-    #[allow(clippy::large_enum_variant)]
-    enum MyBehaviourEvent {
-        Floodsub(FloodsubEvent),
-        Mdns(MdnsEvent),
-    }
-
-    impl From<FloodsubEvent> for MyBehaviourEvent {
-        fn from(event: FloodsubEvent) -> Self {
-            MyBehaviourEvent::Floodsub(event)
-        }
-    }
-
-    impl From<MdnsEvent> for MyBehaviourEvent {
-        fn from(event: MdnsEvent) -> Self {
-            MyBehaviourEvent::Mdns(event)
-        }
-    }
-
-    // Create a Swarm to manage peers and events.
+    // Create a swarm to manage peers and events.
     let mut swarm = {
-        let mdns = TokioMdns::new(Default::default()).await?;
-        let mut behaviour = MyBehaviour {
-            floodsub: Floodsub::new(peer_id),
-            mdns,
-        };
+        // Create a Kademlia behaviour.
+        let mut cfg = KademliaConfig::default();
+        cfg.set_query_timeout(Duration::from_secs(5 * 60));
+        let store = MemoryStore::new(local_peer_id);
+        let mut behaviour = Kademlia::with_config(local_peer_id, store, cfg);
 
-        behaviour.floodsub.subscribe(floodsub_topic.clone());
+        // Add the bootnodes to the local routing table. `libp2p-dns` built
+        // into the `transport` resolves the `dnsaddr` when Kademlia tries
+        // to dial these nodes.
+        let bootaddr = Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io")?;
+        for peer in &BOOTNODES {
+            behaviour.add_address(&PeerId::from_str(peer)?, bootaddr.clone());
+        }
 
-        SwarmBuilder::new(transport, behaviour, peer_id)
-            // We want the connection background tasks to be spawned
-            // onto the tokio runtime.
-            .executor(Box::new(|fut| {
-                tokio::spawn(fut);
-            }))
-            .build()
+        Swarm::new(transport, behaviour, local_peer_id)
     };
 
-    // Reach out to another node if specified
-    if let Some(to_dial) = std::env::args().nth(1) {
-        let addr: Multiaddr = to_dial.parse()?;
-        swarm.dial(addr)?;
-        println!("Dialed {:?}", to_dial);
-    }
+    // Order Kademlia to search for a peer.
+    let to_search: PeerId = if let Some(peer_id) = env::args().nth(1) {
+        peer_id.parse()?
+    } else {
+        identity::Keypair::generate_ed25519().public().into()
+    };
 
-    // Read full lines from stdin
-    let mut stdin = io::BufReader::new(io::stdin()).lines();
+    println!("Searching for the closest peers to {:?}", to_search);
+    swarm.behaviour_mut().get_closest_peers(to_search);
 
-    // Listen on all interfaces and whatever port the OS assigns
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-
-    // Kick it off
-    loop {
-        tokio::select! {
-            line = stdin.next_line() => {
-                let line = line?.expect("stdin closed");
-                swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), line.as_bytes());
-            }
-            event = swarm.select_next_some() => {
-                match event {
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        println!("Listening on {:?}", address);
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Floodsub(FloodsubEvent::Message(message))) => {
-                        println!(
-                                "Received: '{:?}' from {:?}",
-                                String::from_utf8_lossy(&message.data),
-                                message.source
-                            );
-                    }
-                    SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(event)) => {
-                        match event {
-                            MdnsEvent::Discovered(list) => {
-                                for (peer, _) in list {
-                                    swarm.behaviour_mut().floodsub.add_node_to_partial_view(peer);
-                                }
-                            }
-                            MdnsEvent::Expired(list) => {
-                                for (peer, _) in list {
-                                    if !swarm.behaviour().mdns.has_node(&peer) {
-                                        swarm.behaviour_mut().floodsub.remove_node_from_partial_view(&peer);
-                                    }
-                                }
-                            }
+    // Kick it off!
+    task::block_on(async move {
+        loop {
+            let event = swarm.select_next_some().await;
+            if let SwarmEvent::Behaviour(KademliaEvent::OutboundQueryCompleted {
+                result: QueryResult::GetClosestPeers(result),
+                ..
+            }) = event
+            {
+                match result {
+                    Ok(ok) => {
+                        if !ok.peers.is_empty() {
+                            println!("Query finished with closest peers: {:#?}", ok.peers)
+                        } else {
+                            // The example is considered failed as there
+                            // should always be at least 1 reachable peer.
+                            println!("Query finished with no closest peers.")
                         }
                     }
-                    _ => {}
-                }
+                    Err(GetClosestPeersError::Timeout { peers, .. }) => {
+                        if !peers.is_empty() {
+                            println!("Query timed out with closest peers: {:#?}", peers)
+                        } else {
+                            // The example is considered failed as there
+                            // should always be at least 1 reachable peer.
+                            println!("Query timed out with no closest peers.");
+                        }
+                    }
+                };
+
+                break;
             }
         }
-    }
+
+        Ok(())
+    })
 }
